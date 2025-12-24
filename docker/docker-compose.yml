@@ -1,0 +1,242 @@
+services:
+  # ==================== Databases ====================
+  mongodb:
+    image: mongo:7.0.5
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: product-service
+    volumes:
+      - ./docker/data/mongodb:/data/db
+    networks:
+      - artax-network
+  # =========================
+  # MySQL ( shared)
+  # =========================
+  mysql:
+    image: mysql:8.3
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./docker/data/mysql:/var/lib/mysql
+      - ./docker/mysql:/docker-entrypoint-initdb.d
+    networks:
+      - artax-network
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  # =========================
+  # MySQL – Keycloak DB
+  # =========================
+  keycloak-mysql:
+    image: mysql:8.3
+    container_name: keycloak-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${KEYCLOAK_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: keycloak
+      MYSQL_USER: keycloak
+      MYSQL_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+    volumes:
+      - ./docker/data/keycloak-mysql:/var/lib/mysql
+    networks:
+      - artax-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${KEYCLOAK_DB_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  # =========================
+  # Redis (BIL – optional - disabled now )
+  # =========================
+#  redis:
+#    image: redis:7
+#    container_name: redis
+#    ports:
+#      - "6379:6379"
+#    networks:
+#      - artax-network
+
+  # =========================
+  # Keycloak
+  # =========================
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.1
+    container_name: keycloak
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: mysql
+      KC_DB_URL_HOST: keycloak-mysql
+      KC_DB_URL_DATABASE: keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false" # <--- ADD THIS
+      KC_LOG_LEVEL: info
+    ports:
+      - "8181:8080"
+    volumes:
+      - ./docker/data/keycloak-realms/:/opt/keycloak/data/import/
+    depends_on:
+      keycloak-mysql:
+        condition: service_healthy
+    networks:
+      - artax-network
+    healthcheck:
+#      test: ["CMD", "curl", "-f", "http://localhost:8080/realms/master"]
+#      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ==================== Microservices ====================
+  # =========================
+  # Discovery Server
+  # =========================
+  discovery-server:
+    image: discovery-server:latest
+    container_name: discovery-server
+    build:
+      context: ./discovery-server
+      dockerfile: Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      EUREKA_USERNAME: ${EUREKA_USERNAME}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD}
+    ports:
+      - "8761:8761"
+    networks:
+      - artax-network
+    healthcheck:
+#      test: ["CMD", "curl", "-f", "http://localhost:8761"]
+#      test: [ "CMD", "curl", "-f", "http://localhost:8761/actuator/health" ]
+test: ["CMD-SHELL", "curl -f -u $EUREKA_USERNAME:$EUREKA_PASSWORD http://localhost:8761/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  # =========================
+  # API Gateway
+  # =========================
+  api-gateway:
+    image: api-gateway:latest
+    container_name: api-gateway
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      EUREKA_URL: http://discovery-server:8761/eureka
+      KEYCLOAK_ISSUER_URI: ${JWT_ISSUER_URI}
+#      environment:
+#        - EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://discovery-service:8761/eureka/
+#        - SPRING_CLOUD_GATEWAY_DISCOVERY_LOCATOR_ENABLED=true
+#        - SERVER_PORT=8080  # Fixed for consistency
+    ports:
+      - "9000:9000"
+    depends_on:
+      discovery-server:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    networks:
+      - artax-network
+  # =========================
+  # CRM Service
+  # =========================
+  crm-service:
+    image: crm-service:latest
+    container_name: crm-service
+    build:
+      context: ./crm-service
+      dockerfile: Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/CRM_DB?useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-service:8761/eureka
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: ${JWT_ISSUER_URI}
+#    environment:
+#      - EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://discovery-service:8761/eureka/
+#      - SPRING_KAFKA_BOOTSTRAPSERVERS=kafka:9093
+    depends_on:
+      mysql:
+        condition: service_healthy
+      discovery-server:
+        condition: service_healthy
+    networks:
+      - artax-network
+  # =========================
+  # BIL Service
+  # =========================
+  bil-service:
+    image: bil-service:latest
+    container_name: bil-service
+    build:
+      context: ./bil-service
+      dockerfile: Dockerfile
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://discovery-service:8761/eureka
+#      SPRING_REDIS_HOST: redis
+#      SPRING_REDIS_PORT: 6379
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: ${JWT_ISSUER_URI}
+#    environment:
+#      - EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://discovery-service:8761/eureka/
+#      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/bildb?useSSL=false&allowPublicKeyRetrieval=true
+#      - SPRING_KAFKA_BOOTSTRAPSERVERS=kafka:9093
+    depends_on:
+#      - kafka
+      discovery-server:
+        condition: service_healthy
+#      redis:
+#        condition: service_started
+    networks:
+      - artax-network
+
+  # =========================
+  # Kafka (DISABLED – FUTURE)
+  # =========================
+  # zookeeper:
+  #   image: confluentinc/cp-zookeeper:7.6.0
+  #   container_name: zookeeper
+  #   environment:
+  #     ZOOKEEPER_CLIENT_PORT: 2181
+  #   networks:
+  #     - artax-network
+
+  # kafka:
+  #   image: confluentinc/cp-kafka:7.6.0
+  #   container_name: kafka
+  #   ports:
+  #     - "9092:9092"
+  #   depends_on:
+  #     - zookeeper
+  #   environment:
+#      KAFKA_BROKER_ID: 1
+#      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+#      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+#      KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka:9093,OUTSIDE://localhost:9092
+#      KAFKA_LISTENERS: INSIDE://0.0.0.0:9093,OUTSIDE://0.0.0.0:9092
+#      KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
+#      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  #   networks:
+  #     - artax-network
+
+  # ==================== Kafka ====================
+
+
+networks:
+  artax-network:
+    driver: bridge
